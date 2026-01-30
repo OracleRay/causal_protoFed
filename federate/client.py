@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import random
 import torch.nn.functional as F
 from utils.loss_cal import LossCalculator as lossCalculator
 from sklearn.cluster import KMeans
@@ -17,10 +18,11 @@ class FederatedClient:
         self.model.to(self.device)
         self.num_env_classes = int(model_config.get('num_env_classes', 4))
 
-    def train_epoch(self, dataloader, global_prototypes):
+    def train_epoch(self, dataloader, global_prototypes, num_batches=32):
         """
         本地训练循环
         global_prototypes: 服务器下发的全局状态原型库 (P_old)
+        num_batches: 随机采样的batch数量，默认32
         """
         self.model.train()
         loss = 0
@@ -29,7 +31,22 @@ class FederatedClient:
         if global_prototypes is not None:
             global_prototypes = global_prototypes.to(self.device)
 
+        # ====== 新增：随机采样batch索引 ======
+        total_batches = len(dataloader)
+        if total_batches <= num_batches:
+            selected_indices = set(range(total_batches))
+        else:
+            selected_indices = set(random.sample(range(total_batches), num_batches))
+        # ====================================
+
+        count = 0
+        all_pred_losses = 0
         for batch_idx, batch in enumerate(dataloader):
+            # ====== 新增：跳过未被选中的batch ======
+            if batch_idx not in selected_indices:
+                continue
+            # ====================================
+
             # batch: (x, y, adj_matrix)
             x, y, _ = batch
             # x: [B, N, his_num], y: [B, N, pred_num]
@@ -50,26 +67,28 @@ class FederatedClient:
             # 计算各项损失
             # 1. 预测损失
             l_pred = self.loss_calc.calc_pred_loss(y_pred, y)
-
-            # 2. 辅助分类损失
-            l_aux = self.loss_calc.calc_aux_loss(env_logits, env_labels)
-
-            # 3. 因果不变性损失
-            l_inv = self.loss_calc.calc_inv_loss(h_inv, env_labels)
-
-            # 4. 对比损失 (需要flatten节点维度)
-            # [B, N, H] -> [B*N, H]
-            flat_h = h_final.reshape(-1, h_final.size(-1))
-            l_contrast = self.loss_calc.calc_contrast_loss(flat_h, global_prototypes)
-
-            # 总损失 (步骤 S6)
-            loss = l_pred + \
-                   self.loss_calc.lambda1 * l_inv + \
-                   self.loss_calc.lambda2 * l_aux + \
-                   self.loss_calc.lambda3 * l_contrast
-
-            loss.backward()
+            l_pred.backward()
             self.optimizer.step()
+
+            count += 1
+            all_pred_losses += l_pred
+            if count == num_batches:
+                # 2. 辅助分类损失
+                l_aux = self.loss_calc.calc_aux_loss(env_logits, env_labels)
+
+                # 3. 因果不变性损失
+                l_inv = self.loss_calc.calc_inv_loss(h_inv, env_labels)
+
+                # 4. 对比损失 (需要flatten节点维度)
+                # [B, N, H] -> [B*N, H]
+                flat_h = h_final.reshape(-1, h_final.size(-1))
+                l_contrast = self.loss_calc.calc_contrast_loss(flat_h, global_prototypes)
+
+                # 总损失 (步骤 S6)
+                loss = all_pred_losses + \
+                       self.loss_calc.lambda1 * l_inv + \
+                       self.loss_calc.lambda2 * l_aux + \
+                       self.loss_calc.lambda3 * l_contrast
 
         # 步骤 S5: 本地交通原型提取
         self.generate_local_prototypes(all_embeddings)
@@ -94,25 +113,27 @@ class FederatedClient:
         # 保存中心向量作为本地原型集合 P(k)
         self.local_prototypes = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32).to(self.device)
 
-    def update_weights(self, global_weights, client_weights, eta = 0.5):
-        def flatten_weights(weights_dict):
-            """将权重字典展平为单个一维张量"""
-            return torch.cat([param.flatten() for param in weights_dict.values()])
-
-        global_flat = flatten_weights(global_weights)
-        client_flat = flatten_weights(client_weights)
-        sim = F.cosine_similarity(
-            global_flat.unsqueeze(0),
-            client_flat.unsqueeze(0),
-            dim=1
-        ).item()
-        
-        # 对每一层的权重进行更新
+    def update_weights(self, global_weights, client_weights, eta=0.5):
         updated_weights = {}
+
         for key in client_weights.keys():
-            # client_weights + eta * sim * (global_weights - client_weights)
-            updated_weights[key] = (
-                    client_weights[key] +
-                    eta * sim * (global_weights[key] - client_weights[key])
-            )
-        return client_weights + eta * sim * (global_weights - client_weights)
+            # 对每个参数分别计算余弦相似度
+            global_flat = global_weights[key].flatten()
+            client_flat = client_weights[key].flatten()
+
+            sim = F.cosine_similarity(
+                global_flat.unsqueeze(0),
+                client_flat.unsqueeze(0),
+                dim=1
+            ).item()
+
+            # 如果相似则更新,否则保持原值
+            if sim > 0:
+                updated_weights[key] = (
+                        client_weights[key] +
+                        eta * sim * (global_weights[key] - client_weights[key])
+                )
+            else:
+                updated_weights[key] = client_weights[key]
+
+        return updated_weights
