@@ -50,8 +50,8 @@ def main_federated():
     # 训练参数
     hidden_dim = 32
     num_env_classes = 3
-    rounds = 10
-    local_epochs = 1
+    rounds = 90
+    local_epochs = 5
     batch_size = 32
 
     # input_dim = his_num（单一特征）；output_dim = pred_num（多步预测）
@@ -107,15 +107,18 @@ def main_federated():
 
             client_weights[city] = weights
             client_protos[city] = protos
-            client_loss[city] = loss
+            client_loss[city] = loss.item()
 
         # 服务器聚合（使用所有参与方的更新）
         global_weights, global_protos = server.aggregate(client_weights, client_protos, client_loss)
         global_model.load_state_dict(global_weights)
 
-        # 评估目标城市的预测准确度
-        metrics = evaluate_model(target_means, target_stds, global_model, test_loaders[server_city], device)
-        print(f"{server_city}: RMSE: {metrics['RMSE']} | MAE: {metrics['MAE']}")
+        # 输出所有loss:
+        print(f"Client Loss: {client_loss}")
+
+    # 评估目标城市的预测准确度
+    metrics = evaluate_model(target_means, target_stds, global_model, test_loaders[server_city], device)
+    print(f"{server_city}: RMSE: {metrics['RMSE']} | MAE: {metrics['MAE']}")
 
 
 if __name__ == "__main__":
